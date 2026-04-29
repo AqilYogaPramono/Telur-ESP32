@@ -1,0 +1,22 @@
+menu "Pengaturan Transfer HTTP"
+    config ESP_WIFI_SSID
+        string "SSID WiFi STA"
+        default ""
+
+    config ESP_WIFI_PASSWORD
+        string "Kata sandi WiFi STA"
+        default ""
+
+    config ESP_MAXIMUM_RETRY
+        int "Maksimum percobaan ulang"
+        default 5
+
+    config ANALYZE_EGG_ENDPOINT
+        string "Endpoint API Analisis Telur"
+        default "http://192.168.1.22:8000/analyze-egg"
+
+    config MANUAL_HTTP_SERVER_PORT
+        int "Port server HTTP mode manual"
+        range 1 65535
+        default 80
+endmenu

@@ -1,0 +1,6 @@
+menu "Example Configuration"
+    config ESP32_S3_USB_OTG
+        bool "ESP32 S3 USB OTG"
+        default y
+        depends on IDF_TARGET_ESP32S3
+endmenu
