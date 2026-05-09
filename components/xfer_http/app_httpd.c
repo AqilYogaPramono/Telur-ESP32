@@ -257,7 +257,7 @@ void app_httpd_main(void)
     config.stack_size = 8192;
 
     httpd_uri_t health_uri = {
-        .uri = "/health",
+        .uri = "/",
         .method = HTTP_GET,
         .handler = health_handler,
         .user_ctx = NULL
