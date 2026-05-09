@@ -26,3 +26,6 @@ typedef struct {
 
 camera_fb_t *esp_camera_fb_get(void);
 void esp_camera_fb_return(camera_fb_t *fb);
+
+esp_err_t esp_camera_stream_session_begin(void);
+void esp_camera_stream_session_end(void);

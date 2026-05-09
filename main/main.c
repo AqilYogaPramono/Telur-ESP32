@@ -6,6 +6,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb_stream.h"
 #include "esp_log.h"
@@ -19,10 +20,16 @@
 #define FRAME_HEIGHT 480
 #define FRAME_INTERVAL FPS2INTERVAL(15)
 #define FRAME_BUFFER_SIZE (55 * 1024)
+#define USB_CONNECT_WAIT_MS 45000
+#define UVC_WARMUP_SETTLE_MS 400
+#define UVC_WARMUP_DISCARD_FRAMES 10
 
 static const char *TAG = "manual_mode";
 static camera_fb_t s_fb = {0};
 static EventGroupHandle_t s_frame_events = NULL;
+static SemaphoreHandle_t s_stream_mutex = NULL;
+static uvc_config_t s_uvc_config;
+static bool s_uvc_prepared = false;
 
 #define BIT0_FRAME_REQUESTED (0x01 << 0)
 #define BIT1_FRAME_READY     (0x01 << 1)
@@ -172,6 +179,63 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
     s_fb.len = 0;
 }
 
+esp_err_t esp_camera_stream_session_begin(void)
+{
+    if (!s_uvc_prepared || s_stream_mutex == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
+
+    esp_err_t err = uvc_streaming_config(&s_uvc_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "uvc_streaming_config gagal: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_stream_mutex);
+        return err;
+    }
+
+    err = usb_streaming_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "usb_streaming_start gagal: %s", esp_err_to_name(err));
+        xSemaphoreGive(s_stream_mutex);
+        return err;
+    }
+
+    err = usb_streaming_connect_wait(USB_CONNECT_WAIT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "usb_streaming_connect_wait gagal: %s", esp_err_to_name(err));
+        usb_streaming_stop();
+        xSemaphoreGive(s_stream_mutex);
+        return err;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(UVC_WARMUP_SETTLE_MS));
+    for (int i = 0; i < UVC_WARMUP_DISCARD_FRAMES; ++i) {
+        camera_fb_t *wfb = esp_camera_fb_get();
+        if (wfb == NULL) {
+            continue;
+        }
+        esp_camera_fb_return(wfb);
+    }
+
+    return ESP_OK;
+}
+
+void esp_camera_stream_session_end(void)
+{
+    if (s_frame_events != NULL) {
+        xEventGroupClearBits(s_frame_events,
+                             BIT0_FRAME_REQUESTED | BIT1_FRAME_READY | BIT2_FRAME_RELEASED);
+    }
+    esp_err_t err = usb_streaming_stop();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "usb_streaming_stop: %s", esp_err_to_name(err));
+    }
+    if (s_stream_mutex != NULL) {
+        xSemaphoreGive(s_stream_mutex);
+    }
+}
+
 void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
@@ -183,18 +247,21 @@ void app_main(void)
     uint8_t *xfer_buffer_b = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
     uint8_t *frame_buffer = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
     s_frame_events = xEventGroupCreate();
-    if (xfer_buffer_a == NULL || xfer_buffer_b == NULL || frame_buffer == NULL || s_frame_events == NULL) {
+    s_stream_mutex = xSemaphoreCreateMutex();
+    if (xfer_buffer_a == NULL || xfer_buffer_b == NULL || frame_buffer == NULL || s_frame_events == NULL ||
+        s_stream_mutex == NULL) {
         ESP_LOGE(TAG, "alokasi buffer gagal");
-        ESP_LOGE(TAG, "xfer_a=%p xfer_b=%p frame=%p event=%p",
-                 (void *)xfer_buffer_a, (void *)xfer_buffer_b, (void *)frame_buffer, (void *)s_frame_events);
+        ESP_LOGE(TAG, "xfer_a=%p xfer_b=%p frame=%p event=%p mutex=%p",
+                 (void *)xfer_buffer_a, (void *)xfer_buffer_b, (void *)frame_buffer, (void *)s_frame_events,
+                 (void *)s_stream_mutex);
         abort();
     }
 
-    uvc_config_t uvc_config = {
+    s_uvc_config = (uvc_config_t){
         .frame_width = FRAME_WIDTH,
         .frame_height = FRAME_HEIGHT,
         .frame_interval = FRAME_INTERVAL,
-        .xfer_type = UVC_XFER_BULK,
+        .xfer_type = UVC_XFER_ISOC,
         .xfer_buffer_size = FRAME_BUFFER_SIZE,
         .xfer_buffer_a = xfer_buffer_a,
         .xfer_buffer_b = xfer_buffer_b,
@@ -203,10 +270,7 @@ void app_main(void)
         .frame_cb = camera_frame_cb,
         .frame_cb_arg = NULL,
     };
-
-    ESP_ERROR_CHECK(uvc_streaming_config(&uvc_config));
-    ESP_ERROR_CHECK(usb_streaming_start());
-    ESP_ERROR_CHECK(usb_streaming_connect_wait(portMAX_DELAY));
+    s_uvc_prepared = true;
     for (int i = 0; i < 30; ++i) {
         const char *ip = app_wifi_get_ip();
         if (ip[0] != '\0') {

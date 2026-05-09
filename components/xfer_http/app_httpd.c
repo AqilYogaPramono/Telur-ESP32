@@ -86,8 +86,6 @@ static esp_err_t upload_jpeg_and_get_job_id(const uint8_t *jpeg_data, size_t jpe
     int total_len = header_len + (int)jpeg_len + tail_len;
 
     esp_http_client_config_t config = {
-        // Ngrok sering redirect `http://` -> `https://` (mis. 307) sehingga client harus retry.
-        // Kita hindari redirect dulu dengan mengganti skema ke https, supaya request pertama langsung ke TLS.
         .url = UPLOAD_URL,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 10000,
@@ -97,7 +95,6 @@ static esp_err_t upload_jpeg_and_get_job_id(const uint8_t *jpeg_data, size_t jpe
     char upload_url_buf[256] = {0};
     const char *upload_url = UPLOAD_URL;
     if (strncmp(UPLOAD_URL, "http://", 7) == 0 && strstr(UPLOAD_URL, "ngrok") != NULL) {
-        // Keep the rest of URL (host:port/path) unchanged, only swap scheme.
         snprintf(upload_url_buf, sizeof(upload_url_buf), "https://%s", UPLOAD_URL + 7);
         upload_url = upload_url_buf;
         ESP_LOGI(TAG, "UPLOAD_URL diset ke HTTPS dulu (hindari ngrok redirect): %s", upload_url);
@@ -283,14 +280,21 @@ esp_err_t app_httpd_capture_and_upload(int *out_job_id)
         return ESP_ERR_INVALID_ARG;
     }
 
+    esp_err_t err = esp_camera_stream_session_begin();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sesi kamera gagal dimulai: %s", esp_err_to_name(err));
+        return err;
+    }
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb == NULL || fb->buf == NULL || fb->len == 0) {
         ESP_LOGE(TAG, "frame kamera tidak tersedia");
+        esp_camera_stream_session_end();
         return ESP_FAIL;
     }
 
     int job_id = -1;
-    esp_err_t err = ESP_FAIL;
+    err = ESP_FAIL;
     for (int attempt = 1; attempt <= MAX_UPLOAD_RETRIES; ++attempt) {
         err = upload_jpeg_and_get_job_id(fb->buf, fb->len, &job_id);
         if (err == ESP_OK) {
@@ -302,6 +306,8 @@ esp_err_t app_httpd_capture_and_upload(int *out_job_id)
         }
     }
     esp_camera_fb_return(fb);
+    esp_camera_stream_session_end();
+
     if (err != ESP_OK) {
         return err;
     }
