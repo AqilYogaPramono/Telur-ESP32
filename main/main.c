@@ -16,24 +16,34 @@
 #include "app_httpd.h"
 #include "app_wifi.h"
 
-#define FRAME_WIDTH 640
-#define FRAME_HEIGHT 480
-#define FRAME_INTERVAL FPS2INTERVAL(15)
-#define FRAME_BUFFER_SIZE (55 * 1024)
+/* Logitech B525 (046d:0836): MJPEG fmt 2, 320x240 frame 5, VS if 3, alt 3 (MPS 512). */
+#define FRAME_WIDTH 320
+#define FRAME_HEIGHT 240
+#define FRAME_INTERVAL FRAME_INTERVAL_FPS_15
+#define FRAME_BUFFER_SIZE (40 * 1024)
+#define UVC_FORMAT_INDEX 2
+#define UVC_FRAME_INDEX 5
+#define UVC_VS_INTERFACE 3
+#define UVC_VS_INTERFACE_ALT 3
+#define UVC_VS_EP_ADDR 0x81
+#define UVC_VS_EP_MPS 512
 #define USB_CONNECT_WAIT_MS 45000
-#define UVC_WARMUP_SETTLE_MS 400
-#define UVC_WARMUP_DISCARD_FRAMES 10
+#define UVC_WARMUP_SETTLE_MS 800
+#define UVC_WARMUP_DISCARD_FRAMES 5
+#define UVC_CAPTURE_SETTLE_MS 150
+#define UVC_CAPTURE_DISCARD_FRAMES 3
 
 static const char *TAG = "manual_mode";
 static camera_fb_t s_fb = {0};
+static uint8_t *s_capture_jpeg_buf = NULL;
 static EventGroupHandle_t s_frame_events = NULL;
 static SemaphoreHandle_t s_stream_mutex = NULL;
 static uvc_config_t s_uvc_config;
 static bool s_uvc_prepared = false;
+static bool s_usb_stream_active = false;
 
 #define BIT0_FRAME_REQUESTED (0x01 << 0)
 #define BIT1_FRAME_READY     (0x01 << 1)
-#define BIT2_FRAME_RELEASED  (0x01 << 2)
 
 #define DAILY_CAPTURE_HOUR_WIB 13
 #define DAILY_CAPTURE_MINUTE_WIB 20
@@ -122,9 +132,10 @@ camera_fb_t *esp_camera_fb_get(void)
         BIT1_FRAME_READY,
         pdTRUE,
         pdTRUE,
-        pdMS_TO_TICKS(5000)
+        pdMS_TO_TICKS(15000)
     );
     if ((bits & BIT1_FRAME_READY) == 0 || s_fb.buf == NULL || s_fb.len == 0) {
+        xEventGroupClearBits(s_frame_events, BIT0_FRAME_REQUESTED | BIT1_FRAME_READY);
         ESP_LOGW(TAG, "waktu tunggu frame kamera habis");
         return NULL;
     }
@@ -136,7 +147,9 @@ void esp_camera_fb_return(camera_fb_t *fb)
 {
     (void)fb;
     if (s_frame_events != NULL) {
-        xEventGroupSetBits(s_frame_events, BIT2_FRAME_RELEASED);
+        s_fb.buf = NULL;
+        s_fb.len = 0;
+        xEventGroupClearBits(s_frame_events, BIT0_FRAME_REQUESTED | BIT1_FRAME_READY);
     }
 }
 
@@ -149,15 +162,23 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
     if (frame->frame_format != UVC_FRAME_FORMAT_MJPEG) {
         return;
     }
-    if (s_frame_events == NULL) {
+    if (s_frame_events == NULL || s_capture_jpeg_buf == NULL) {
         return;
     }
 
     if ((xEventGroupGetBits(s_frame_events) & BIT0_FRAME_REQUESTED) == 0) {
         return;
     }
+    if ((xEventGroupGetBits(s_frame_events) & BIT1_FRAME_READY) != 0) {
+        return;
+    }
+    if (frame->data_bytes > FRAME_BUFFER_SIZE) {
+        ESP_LOGW(TAG, "frame MJPEG terlalu besar: %u", (unsigned)frame->data_bytes);
+        return;
+    }
 
-    s_fb.buf = frame->data;
+    memcpy(s_capture_jpeg_buf, frame->data, frame->data_bytes);
+    s_fb.buf = s_capture_jpeg_buf;
     s_fb.len = frame->data_bytes;
     s_fb.width = frame->width;
     s_fb.height = frame->height;
@@ -165,18 +186,26 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
     s_fb.timestamp.tv_sec = frame->sequence;
     s_fb.timestamp.tv_usec = 0;
 
-    xEventGroupClearBits(s_frame_events, BIT2_FRAME_RELEASED);
     xEventGroupSetBits(s_frame_events, BIT1_FRAME_READY);
-    xEventGroupWaitBits(
-        s_frame_events,
-        BIT2_FRAME_RELEASED,
-        pdTRUE,
-        pdTRUE,
-        pdMS_TO_TICKS(10000)
-    );
-    xEventGroupClearBits(s_frame_events, BIT0_FRAME_REQUESTED);
-    s_fb.buf = NULL;
-    s_fb.len = 0;
+}
+
+static void discard_warmup_frames(int count)
+{
+    for (int i = 0; i < count; ++i) {
+        camera_fb_t *wfb = esp_camera_fb_get();
+        if (wfb == NULL) {
+            continue;
+        }
+        esp_camera_fb_return(wfb);
+    }
+}
+
+static void usb_stream_shutdown_locked(void)
+{
+    if (s_usb_stream_active) {
+        usb_streaming_stop();
+        s_usb_stream_active = false;
+    }
 }
 
 esp_err_t esp_camera_stream_session_begin(void)
@@ -187,35 +216,37 @@ esp_err_t esp_camera_stream_session_begin(void)
 
     xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
 
-    esp_err_t err = uvc_streaming_config(&s_uvc_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uvc_streaming_config gagal: %s", esp_err_to_name(err));
-        xSemaphoreGive(s_stream_mutex);
-        return err;
-    }
-
-    err = usb_streaming_start();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "usb_streaming_start gagal: %s", esp_err_to_name(err));
-        xSemaphoreGive(s_stream_mutex);
-        return err;
-    }
-
-    err = usb_streaming_connect_wait(USB_CONNECT_WAIT_MS);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "usb_streaming_connect_wait gagal: %s", esp_err_to_name(err));
-        usb_streaming_stop();
-        xSemaphoreGive(s_stream_mutex);
-        return err;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(UVC_WARMUP_SETTLE_MS));
-    for (int i = 0; i < UVC_WARMUP_DISCARD_FRAMES; ++i) {
-        camera_fb_t *wfb = esp_camera_fb_get();
-        if (wfb == NULL) {
-            continue;
+    if (!s_usb_stream_active) {
+        esp_err_t err = uvc_streaming_config(&s_uvc_config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "uvc_streaming_config gagal: %s", esp_err_to_name(err));
+            xSemaphoreGive(s_stream_mutex);
+            return err;
         }
-        esp_camera_fb_return(wfb);
+
+        err = usb_streaming_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "usb_streaming_start gagal: %s", esp_err_to_name(err));
+            usb_stream_shutdown_locked();
+            xSemaphoreGive(s_stream_mutex);
+            return err;
+        }
+
+        err = usb_streaming_connect_wait(USB_CONNECT_WAIT_MS);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "usb_streaming_connect_wait gagal: %s", esp_err_to_name(err));
+            usb_stream_shutdown_locked();
+            xSemaphoreGive(s_stream_mutex);
+            return err;
+        }
+
+        s_usb_stream_active = true;
+        ESP_LOGI(TAG, "USB UVC aktif %dx%d @15fps (B525)", FRAME_WIDTH, FRAME_HEIGHT);
+        vTaskDelay(pdMS_TO_TICKS(UVC_WARMUP_SETTLE_MS));
+        discard_warmup_frames(UVC_WARMUP_DISCARD_FRAMES);
+    } else {
+        vTaskDelay(pdMS_TO_TICKS(UVC_CAPTURE_SETTLE_MS));
+        discard_warmup_frames(UVC_CAPTURE_DISCARD_FRAMES);
     }
 
     return ESP_OK;
@@ -224,12 +255,7 @@ esp_err_t esp_camera_stream_session_begin(void)
 void esp_camera_stream_session_end(void)
 {
     if (s_frame_events != NULL) {
-        xEventGroupClearBits(s_frame_events,
-                             BIT0_FRAME_REQUESTED | BIT1_FRAME_READY | BIT2_FRAME_RELEASED);
-    }
-    esp_err_t err = usb_streaming_stop();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "usb_streaming_stop: %s", esp_err_to_name(err));
+        xEventGroupClearBits(s_frame_events, BIT0_FRAME_REQUESTED | BIT1_FRAME_READY);
     }
     if (s_stream_mutex != NULL) {
         xSemaphoreGive(s_stream_mutex);
@@ -246,14 +272,15 @@ void app_main(void)
     uint8_t *xfer_buffer_a = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
     uint8_t *xfer_buffer_b = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
     uint8_t *frame_buffer = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
+    s_capture_jpeg_buf = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
     s_frame_events = xEventGroupCreate();
     s_stream_mutex = xSemaphoreCreateMutex();
-    if (xfer_buffer_a == NULL || xfer_buffer_b == NULL || frame_buffer == NULL || s_frame_events == NULL ||
-        s_stream_mutex == NULL) {
+    if (xfer_buffer_a == NULL || xfer_buffer_b == NULL || frame_buffer == NULL || s_capture_jpeg_buf == NULL ||
+        s_frame_events == NULL || s_stream_mutex == NULL) {
         ESP_LOGE(TAG, "alokasi buffer gagal");
-        ESP_LOGE(TAG, "xfer_a=%p xfer_b=%p frame=%p event=%p mutex=%p",
-                 (void *)xfer_buffer_a, (void *)xfer_buffer_b, (void *)frame_buffer, (void *)s_frame_events,
-                 (void *)s_stream_mutex);
+        ESP_LOGE(TAG, "xfer_a=%p xfer_b=%p frame=%p capture=%p event=%p mutex=%p",
+                 (void *)xfer_buffer_a, (void *)xfer_buffer_b, (void *)frame_buffer, (void *)s_capture_jpeg_buf,
+                 (void *)s_frame_events, (void *)s_stream_mutex);
         abort();
     }
 
@@ -261,7 +288,14 @@ void app_main(void)
         .frame_width = FRAME_WIDTH,
         .frame_height = FRAME_HEIGHT,
         .frame_interval = FRAME_INTERVAL,
+        .format = UVC_FORMAT_MJPEG,
         .xfer_type = UVC_XFER_ISOC,
+        .format_index = UVC_FORMAT_INDEX,
+        .frame_index = UVC_FRAME_INDEX,
+        .interface = UVC_VS_INTERFACE,
+        .interface_alt = UVC_VS_INTERFACE_ALT,
+        .ep_addr = UVC_VS_EP_ADDR,
+        .ep_mps = UVC_VS_EP_MPS,
         .xfer_buffer_size = FRAME_BUFFER_SIZE,
         .xfer_buffer_a = xfer_buffer_a,
         .xfer_buffer_b = xfer_buffer_b,
