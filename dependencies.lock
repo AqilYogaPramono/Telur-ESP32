@@ -6,33 +6,23 @@ dependencies:
       require: private
       version: '>=4.1'
     source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 0.5.3
-  espressif/usb_stream:
-    component_hash: 130b26080cb06ea826a4b9371b6ced927034ba0cbbe0a13bbe408d10d5ca2972
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: 0.5.*
-    - name: idf
-      require: private
-      version: '>=4.4.1'
-    source:
       registry_url: https://components.espressif.com/
       type: service
-    targets:
-    - esp32s2
-    - esp32s3
-    version: 1.5.1
+    version: 0.5.3
   idf:
     source:
       type: idf
     version: 5.4.3
+  usb_stream:
+    dependencies: []
+    source:
+      path: D:\Github\PA-Telur\Telur-ESP32\components\usb_stream
+      type: local
+    version: 1.5.1
 direct_dependencies:
-- espressif/usb_stream
+- espressif/cmake_utilities
 - idf
-manifest_hash: 48a95c39eaa1b60383f6ce959c34f3266d776e319dd12b3d10cc3f85355132c8
+- usb_stream
+manifest_hash: c1d065ed47fc887509d2ceea12e66d34515a2430773c4b9b0399d0018c6ad0f4
 target: esp32s3
 version: 2.0.0
