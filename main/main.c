@@ -12,13 +12,13 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_sntp.h"
+#include "driver/gpio.h"
 #include "esp_camera.h"
 #include "app_httpd.h"
 #include "app_wifi.h"
 
-/* Logitech B525 (046d:0836): MJPEG fmt 2, 320x240 frame 5, VS if 3, alt 3 (MPS 512). */
-#define FRAME_WIDTH 320
-#define FRAME_HEIGHT 240
+#define FRAME_WIDTH 640
+#define FRAME_HEIGHT 480
 #define FRAME_INTERVAL FRAME_INTERVAL_FPS_15
 #define FRAME_BUFFER_SIZE (40 * 1024)
 #define UVC_FORMAT_INDEX 2
@@ -32,6 +32,10 @@
 #define UVC_WARMUP_DISCARD_FRAMES 5
 #define UVC_CAPTURE_SETTLE_MS 150
 #define UVC_CAPTURE_DISCARD_FRAMES 3
+#define PIN_LAMPU_HPL GPIO_NUM_45
+#define HPL_ON_LEVEL 0
+#define HPL_OFF_LEVEL 1
+#define HPL_LIGHT_SETTLE_MS 2000
 
 static const char *TAG = "manual_mode";
 static camera_fb_t s_fb = {0};
@@ -189,6 +193,31 @@ static void camera_frame_cb(uvc_frame_t *frame, void *ptr)
     xEventGroupSetBits(s_frame_events, BIT1_FRAME_READY);
 }
 
+static void hpl_pin_init(void)
+{
+    gpio_reset_pin(PIN_LAMPU_HPL);
+    gpio_set_direction(PIN_LAMPU_HPL, GPIO_MODE_OUTPUT);
+    gpio_set_pull_mode(PIN_LAMPU_HPL, GPIO_FLOATING);
+    gpio_hold_dis(PIN_LAMPU_HPL);
+    gpio_set_drive_capability(PIN_LAMPU_HPL, GPIO_DRIVE_CAP_3);
+    gpio_set_level(PIN_LAMPU_HPL, HPL_OFF_LEVEL);
+}
+
+static void hpl_on(void)
+{
+    gpio_hold_dis(PIN_LAMPU_HPL);
+    gpio_set_direction(PIN_LAMPU_HPL, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_LAMPU_HPL, HPL_ON_LEVEL);
+    gpio_hold_en(PIN_LAMPU_HPL);
+}
+
+static void hpl_off(void)
+{
+    gpio_hold_dis(PIN_LAMPU_HPL);
+    gpio_set_direction(PIN_LAMPU_HPL, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_LAMPU_HPL, HPL_OFF_LEVEL);
+}
+
 static void discard_warmup_frames(int count)
 {
     for (int i = 0; i < count; ++i) {
@@ -216,10 +245,14 @@ esp_err_t esp_camera_stream_session_begin(void)
 
     xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
 
+    hpl_on();
+    vTaskDelay(pdMS_TO_TICKS(HPL_LIGHT_SETTLE_MS));
+
     if (!s_usb_stream_active) {
         esp_err_t err = uvc_streaming_config(&s_uvc_config);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "uvc_streaming_config gagal: %s", esp_err_to_name(err));
+            hpl_off();
             xSemaphoreGive(s_stream_mutex);
             return err;
         }
@@ -228,6 +261,7 @@ esp_err_t esp_camera_stream_session_begin(void)
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "usb_streaming_start gagal: %s", esp_err_to_name(err));
             usb_stream_shutdown_locked();
+            hpl_off();
             xSemaphoreGive(s_stream_mutex);
             return err;
         }
@@ -236,6 +270,7 @@ esp_err_t esp_camera_stream_session_begin(void)
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "usb_streaming_connect_wait gagal: %s", esp_err_to_name(err));
             usb_stream_shutdown_locked();
+            hpl_off();
             xSemaphoreGive(s_stream_mutex);
             return err;
         }
@@ -257,6 +292,7 @@ void esp_camera_stream_session_end(void)
     if (s_frame_events != NULL) {
         xEventGroupClearBits(s_frame_events, BIT0_FRAME_REQUESTED | BIT1_FRAME_READY);
     }
+    hpl_off();
     if (s_stream_mutex != NULL) {
         xSemaphoreGive(s_stream_mutex);
     }
@@ -267,6 +303,7 @@ void app_main(void)
     esp_log_level_set("*", ESP_LOG_WARN);
     app_wifi_main();
     app_httpd_main();
+    hpl_pin_init();
     initialize_time_wib();
 
     uint8_t *xfer_buffer_a = (uint8_t *)malloc(FRAME_BUFFER_SIZE);
